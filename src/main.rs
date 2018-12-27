@@ -2,6 +2,7 @@
 extern crate log;
 
 use clap::*;
+use std::net::IpAddr;
 use std::process::exit;
 use tokio::io::write_all;
 use tokio::prelude::*;
@@ -24,6 +25,13 @@ fn main() {
                 .help("Enables verbose logging"),
         )
         .arg(
+            Arg::with_name("host")
+                .short("h")
+                .long("host")
+                .takes_value(true)
+                .help("Sets the host address (default: 0.0.0.0)"),
+        )
+        .arg(
             Arg::with_name("port")
                 .short("p")
                 .long("port")
@@ -32,8 +40,17 @@ fn main() {
         )
         .get_matches();
 
+    let host = matches.value_of("host").unwrap_or("0.0.0.0");
+    let host: IpAddr = match host.parse() {
+        Ok(host) => host,
+        Err(_) => {
+            eprintln!("Invalid host “{}”", host);
+            exit(1)
+        }
+    };
+
     let port = matches.value_of("port").unwrap_or(DEFAULT_PORT);
-    let port = match port.parse() {
+    let port: u16 = match port.parse() {
         Ok(port) => port,
         Err(_) => {
             eprintln!("Invalid port “{}”", port);
@@ -65,15 +82,18 @@ fn main() {
 
     runtime
         .block_on::<_, _, ()>(future::lazy(move || {
-            let server = match Server::bind(("127.0.0.1", port), &Handle::current()) {
+            let server = match Server::bind((host, port), &Handle::current()) {
                 Ok(server) => server,
                 Err(err) => {
-                    eprintln!("Failed to bind websocket server to port {}: {}", port, err);
+                    eprintln!(
+                        "Failed to bind websocket server to {}:{}: {}",
+                        host, port, err
+                    );
                     exit(1)
                 }
             };
 
-            info!("Listening on :{}", port);
+            info!("Listening on {}:{}", host, port);
 
             server
                 .incoming()

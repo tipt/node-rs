@@ -3,9 +3,13 @@
 use byteorder::{ReadBytesExt, BE};
 use semver::Version;
 use serde::de::{self, Error, Unexpected};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
 use std::io::{self, Seek, SeekFrom};
+
+const MAX_PACKET_SIZE: usize = 2_100_000;
+const MAX_FORWARD_MSG_SIZE: usize = 2_000_000;
 
 /// Creates a repr(primitive) enum with ser/de implementations.
 macro_rules! enum_primitive {
@@ -21,7 +25,7 @@ macro_rules! enum_primitive {
     ) => {
         $(#[$meta])*
         #[repr($ty)]
-        #[derive(Clone, Copy, PartialEq)]
+        #[derive(Debug, Clone, Copy, PartialEq)]
         $prefix enum $name {
             $($(#[$vmeta])* $variant = $value,)+
         }
@@ -103,8 +107,11 @@ enum_primitive! {
         /// Obtains information about the node.
         GetInfo = 0x03,
 
+        /// Obtains a node’s OpenPGP public key.
+        GetNodeKey = 0x20,
+
         /// The client requests that a message be forwarded to another node.
-        Forward = 0x20,
+        Forward = 0x21,
     }
 }
 
@@ -120,35 +127,101 @@ impl CNNodeRequestType {
     /// If true, requires the client to be signed in.
     pub fn requires_signed_in(self) -> bool {
         match self {
-            CNNodeRequestType::Forward => true,
+            CNNodeRequestType::GetNodeKey | CNNodeRequestType::Forward => true,
             _ => false,
         }
     }
 }
 
 /// A packet from a client.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientPacket {
-    Request(NodeRequest),
+    Request(u8, NodeRequest),
 }
 
 /// A request from a client.
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeRequest {
-    /// A handshake request.
     Handshake {
-        /// The packet ID.
-        id: u8,
-
         /// The client’s protocol version.
         version: Version,
     },
+    GetNodeKey {
+        /// The fully-qualified domain name of the node whose OpenPGP key is being requested.
+        node: String,
+    },
+    Forward {
+        /// The fully-qualified domain name of the node to forward the message to.
+        node: String,
+
+        /// Whether to wait for the node to respond and send the response back to the client.
+        wait: bool,
+
+        /// The encrypted CNNodeForwardRequest to send to the node.
+        /// Must be encrypted using the recipient node’s OpenPGP public key.
+        message: Vec<u8>,
+    },
 }
 
+/// A packet from a node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodePacket {
+    Response(u8, Result<NodeResponse, NodeErrResponse>),
+}
+
+impl Serialize for NodePacket {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_struct("packet", 3)?;
+        match self {
+            NodePacket::Response(id, content) => {
+                map.serialize_field("id", id)?;
+                map.serialize_field("pakt", &CNPacketType::Response)?;
+                match content {
+                    Ok(content) => map.serialize_field("body", content)?,
+                    Err(error) => map.serialize_field("err", error)?,
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// A response to a client.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum NodeResponse {
+    Handshake {
+        /// The server’s protocol version.
+        #[serde(rename = "ver")]
+        version: Version,
+
+        /// Whether the node is compatible with the client version.
+        #[serde(rename = "comp")]
+        compatible: bool,
+    },
+    #[serde(skip)]
+    Forward,
+    ForwardWithData {
+        /// The response from the recipient node.
+        #[serde(rename = "resp")]
+        response: Vec<u8>,
+    },
+    GetNodeKey {
+        /// The requested node’s OpenPGP public key, un-armored.
+        key: Vec<u8>,
+    },
+}
+
+/// Error responses to a client.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum NodeErrResponse {}
+
 /// Returns the size of the given msgpack value in bytes.
-fn msgpack_value_size(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
+fn msgpack_value_size(cursor: &mut io::Cursor<&[u8]>) -> Result<usize, rmp_serde::decode::Error> {
     use rmp::{decode::read_marker, Marker};
     use rmp_serde::decode::Error;
 
-    let mut cursor = io::Cursor::new(data);
+    let start_pos = cursor.position();
 
     /// Moves the cursor forward by a certain about of bytes.
     macro_rules! skip {
@@ -166,16 +239,13 @@ fn msgpack_value_size(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
 
         // skips n msgpack objects
         (deep $n:expr) => {{
-            let mut len = 0;
             for _ in 0..$n {
-                let data = &data[cursor.position() as usize..];
-                len += msgpack_value_size(data)?;
+                msgpack_value_size(cursor)?;
             }
-            cursor.seek(SeekFrom::Current(len as i64)).map_err(Error::InvalidDataRead)?;
         }};
     }
 
-    match read_marker(&mut cursor)? {
+    match read_marker(cursor)? {
         Marker::FixPos(_) | Marker::FixNeg(_) | Marker::Null | Marker::True | Marker::False => (),
         Marker::U8 | Marker::I8 => skip!(1),
         Marker::U16 | Marker::I16 | Marker::FixExt1 => skip!(2),
@@ -222,7 +292,7 @@ fn msgpack_value_size(data: &[u8]) -> Result<usize, rmp_serde::decode::Error> {
         Marker::Reserved => return Err(Error::Uncategorized("unexpected reserved type".into())),
     }
 
-    Ok(cursor.position() as usize)
+    Ok((cursor.position() - start_pos) as usize)
 }
 
 impl ClientPacket {
@@ -230,6 +300,12 @@ impl ClientPacket {
     ///
     /// This is not implemented with serde because it requires msgpack-specific features.
     pub fn deserialize(data: &[u8]) -> Result<ClientPacket, rmp_serde::decode::Error> {
+        if data.len() > MAX_PACKET_SIZE {
+            return Err(rmp_serde::decode::Error::Uncategorized(
+                "packet too large".into(),
+            ));
+        }
+
         use rmp::decode::*;
         use rmp_serde::Deserializer;
 
@@ -270,21 +346,21 @@ impl ClientPacket {
                 b"reqt" => {
                     req_type = {
                         let pos = cursor.position() as usize;
-                        let len = msgpack_value_size(&data[pos..])?;
+                        let len = msgpack_value_size(&mut cursor)?;
                         Some(&data[pos..pos + len])
                     }
                 }
                 b"body" => {
                     body = {
                         let pos = cursor.position() as usize;
-                        let len = msgpack_value_size(&data[pos..])?;
+                        let len = msgpack_value_size(&mut cursor)?;
                         Some(&data[pos..pos + len])
                     }
                 }
                 b"err " => {
                     err = {
                         let pos = cursor.position() as usize;
-                        let len = msgpack_value_size(&data[pos..])?;
+                        let len = msgpack_value_size(&mut cursor)?;
                         Some(&data[pos..pos + len])
                     }
                 }
@@ -326,10 +402,57 @@ impl ClientPacket {
                         }
                         let body = Body::deserialize(&mut Deserializer::from_slice(body))?;
 
-                        Ok(ClientPacket::Request(NodeRequest::Handshake {
+                        Ok(ClientPacket::Request(
                             id,
-                            version: body.ver,
-                        }))
+                            NodeRequest::Handshake { version: body.ver },
+                        ))
+                    }
+                    CNNodeRequestType::GetNodeKey => {
+                        #[derive(Deserialize)]
+                        struct Body {
+                            node: String,
+                        }
+                        let body = Body::deserialize(&mut Deserializer::from_slice(body))?;
+
+                        if body.node.len() > 500 {
+                            return Err(rmp_serde::decode::Error::Uncategorized(
+                                "node name too long".into(),
+                            ));
+                        }
+
+                        Ok(ClientPacket::Request(
+                            id,
+                            NodeRequest::GetNodeKey { node: body.node },
+                        ))
+                    }
+                    CNNodeRequestType::Forward => {
+                        #[derive(Deserialize)]
+                        struct Body {
+                            node: String,
+                            wait: bool,
+                            msg: Vec<u8>,
+                        }
+                        let body = Body::deserialize(&mut Deserializer::from_slice(body))?;
+
+                        if body.node.len() > 500 {
+                            return Err(rmp_serde::decode::Error::Uncategorized(
+                                "node name too long".into(),
+                            ));
+                        }
+                        if body.msg.len() > MAX_FORWARD_MSG_SIZE {
+                            return Err(rmp_serde::decode::Error::Uncategorized(
+                                "message too long".into(),
+                            ));
+                        }
+
+                        Ok(ClientPacket::Request(
+                            id,
+                            NodeRequest::Forward {
+                                node: body.node,
+                                wait: body.wait,
+                                message: body.msg,
+                            },
+                        ))
                     }
                     _ => unimplemented!("other request types"),
                 }
