@@ -1,8 +1,12 @@
 //! Clients.
 
+use crate::protocol::{ClientPacket, NodePacket, NodeRequest, NodeResponse};
 use futures::sync::mpsc;
-use crate::protocol::{ClientPacket, NodeRequest, NodePacket, NodeResponse};
+use lazy_static::lazy_static;
 use parking_lot::Mutex;
+use rmp_serde::Serializer;
+use semver::{Version, VersionReq};
+use serde::Serialize;
 use std::time::{Duration, Instant};
 use tokio::codec::Framed;
 use tokio::prelude::*;
@@ -10,10 +14,6 @@ use tokio::timer::Delay;
 use websocket::futures::stream::Stream;
 use websocket::r#async::{MessageCodec, TcpStream};
 use websocket::{OwnedMessage, WebSocketError};
-use semver::{Version, VersionReq};
-use lazy_static::lazy_static;
-use serde::Serialize;
-use rmp_serde::Serializer;
 
 const CLIENT_HANDSHAKE_TIMEOUT_SECS: u64 = 3;
 
@@ -31,10 +31,13 @@ pub fn accept(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> impl Fut
             Some(OwnedMessage::Binary(buf)) => match ClientPacket::deserialize(&buf) {
                 Ok(ClientPacket::Request(id, NodeRequest::Handshake { version })) => {
                     let compatible = REQUIRED_PROTOCOL_VERSION.matches(&version);
-                    let msg = NodePacket::Response(id, Ok(NodeResponse::Handshake {
-                        version: SERVER_PROTOCOL_VERSION.clone(),
-                        compatible,
-                    }));
+                    let msg = NodePacket::Response(
+                        id,
+                        Ok(NodeResponse::Handshake {
+                            version: SERVER_PROTOCOL_VERSION.clone(),
+                            compatible,
+                        }),
+                    );
 
                     if REQUIRED_PROTOCOL_VERSION.matches(&version) {
                         let client = Client::new(socket);
@@ -45,16 +48,17 @@ pub fn accept(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> impl Fut
                         if let Err(err) = msg.serialize(&mut Serializer::new_named(&mut buf)) {
                             error!("Failed to serialize handshake response: {:?}", err);
                         } else {
-                            tokio::spawn(socket.send(OwnedMessage::Binary(buf))
+                            tokio::spawn(
+                                socket
+                                    .send(OwnedMessage::Binary(buf))
                                     .map(|_| {})
-                                    .map_err(|_| {}));
+                                    .map_err(|_| {}),
+                            );
                         }
                         future::Either::B(future::ok(()))
                     }
                 }
-                Ok(_) | Err(_) => {
-                    future::Either::B(future::ok(()))
-                },
+                Ok(_) | Err(_) => future::Either::B(future::ok(())),
             },
             Some(_) | None => future::Either::B(future::ok(())),
         })
