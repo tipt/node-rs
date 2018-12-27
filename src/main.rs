@@ -4,7 +4,6 @@ extern crate log;
 use clap::*;
 use std::net::IpAddr;
 use std::process::exit;
-use tokio::io::write_all;
 use tokio::prelude::*;
 use tokio::reactor::Handle;
 use tokio::runtime::Runtime;
@@ -14,6 +13,7 @@ use websocket::server::InvalidConnection;
 const DEFAULT_PORT: &str = "8478";
 
 pub mod client;
+pub mod http;
 pub mod protocol;
 
 fn main() {
@@ -22,11 +22,12 @@ fn main() {
             Arg::with_name("verbose")
                 .short("v")
                 .long("verbose")
-                .help("Enables verbose logging"),
+                .multiple(true)
+                .help("Enables debug/trace logging (repeat to increase verbosity)"),
         )
         .arg(
             Arg::with_name("host")
-                .short("h")
+                .short("H")
                 .long("host")
                 .takes_value(true)
                 .help("Sets the host address (default: 0.0.0.0)"),
@@ -57,7 +58,17 @@ fn main() {
             exit(1)
         }
     };
-    let verbose = matches.is_present("verbose");
+
+    let (log_level, lib_log_level) = match matches.occurrences_of("verbose") {
+        0 => (log::LevelFilter::Info, log::LevelFilter::Info),
+        1 => (log::LevelFilter::Debug, log::LevelFilter::Debug),
+        2 => (log::LevelFilter::Trace, log::LevelFilter::Debug),
+        3 => (log::LevelFilter::Trace, log::LevelFilter::Trace),
+        n => {
+            eprintln!("No such verbosity level: {}", n);
+            exit(1)
+        }
+    };
 
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -69,11 +80,12 @@ fn main() {
                 message,
             ))
         })
-        .level(if verbose {
-            log::LevelFilter::Trace
-        } else {
-            log::LevelFilter::Info
-        })
+        .level(log_level)
+        // set a different log level for some targets that’d spam stderr otherwise
+        .level_for("tokio_threadpool", lib_log_level)
+        .level_for("tokio_reactor", lib_log_level)
+        .level_for("tokio_io", lib_log_level)
+        .level_for("hyper", lib_log_level)
         .chain(std::io::stderr())
         .apply()
         .expect("Failed to initialize logger");
@@ -97,88 +109,37 @@ fn main() {
 
             server
                 .incoming()
-                .then(|result| {
-                    match result {
-                        Ok(res) => Ok(Some(res)),
-                        Err(InvalidConnection {
-                            stream,
-                            parsed,
-                            buffer: _,
-                            error: _,
-                        }) => {
-                            if let (Some(stream), Some(req)) = (stream, parsed) {
-                                tokio::spawn(
-                                    write_html_error(
-                                        stream,
-                                        req.version.as_ref(),
-                                        "400 Bad Request",
-                                    )
-                                    .map(|_| {})
-                                    .map_err(|_| { /* don’t care */ }),
-                                );
-                            } else {
-                                debug!("ignoring invalid connection");
-                            }
-                            Ok(None)
+                .then(|result| match result {
+                    Ok(res) => Ok(Some(res)),
+                    Err(InvalidConnection {
+                        stream,
+                        parsed,
+                        buffer: _,
+                        error: _,
+                    }) => {
+                        if let (Some(stream), Some(req)) = (stream, parsed) {
+                            http::handle_http(stream, req);
+                        } else {
+                            trace!("Ignoring invalid connection");
                         }
+                        Ok(None)
                     }
                 })
                 .filter_map(|item| item)
                 .for_each(|(upgrade, addr)| {
-                    info!("Acceping websocket connection from {}", addr);
+                    debug!("Acceping websocket connection from {}", addr);
                     let f = upgrade
                         .accept()
-                        .map_err(|err| {
-                            error!("oh no websocket error: {:?}", err);
+                        .map_err(move |err| {
+                            error!(
+                                "Failed to accept websocket connection from {}: {:?}",
+                                addr, err
+                            );
                         })
-                        .and_then(|(client, _)| client::accept(client).map_err(|_| {}))
-                        .map(|_| {});
+                        .and_then(|(client, _)| client::accept(client));
                     tokio::spawn(f);
                     Ok(())
                 })
         }))
         .expect("WebSocket server died");
-}
-
-/// Writes a simple HTTP response with an HTML error page to the given AsyncWrite.
-///
-/// - `version`: the HTTP version; something like `HTTP/1.1`
-/// - `error`: the HTTP error (such as `404 Not Found`), must be valid
-fn write_html_error<T: AsyncWrite>(stream: T, version: &str, error: &str) -> impl Future {
-    let server_name = format!("Tipt node-rs/{}", env!("CARGO_PKG_VERSION"));
-
-    let html = format!(
-        "<!DOCTYPE html>
-<html>
-    <head>
-        <title>{0}</title>
-        <meta charset='utf-8' />
-    </head>
-    <body style='font-family: monospace'>
-        <center>
-            <h1>{0}</h1>
-            <hr>
-            {1}
-        </center>
-    </body>
-</html>",
-        error, server_name
-    );
-
-    let response = format!(
-        "\
-{} {}\r
-Content-Type: text/html; charset=UTF-8\r
-Content-Length: {}\r
-Server: {}\r
-\r
-{}",
-        version,
-        error,
-        html.len(),
-        server_name,
-        html
-    );
-
-    write_all(stream, response)
 }

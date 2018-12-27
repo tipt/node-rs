@@ -23,7 +23,9 @@ lazy_static! {
 }
 
 /// Accepts a websocket connection and creates a client if a Handshake message is received on time.
-pub fn accept(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> impl Future {
+pub fn accept(
+    socket: Framed<TcpStream, MessageCodec<OwnedMessage>>,
+) -> impl Future<Item = (), Error = ()> {
     let f = socket
         .into_future()
         .map_err(|(err, _)| err)
@@ -31,6 +33,14 @@ pub fn accept(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> impl Fut
             Some(OwnedMessage::Binary(buf)) => match ClientPacket::deserialize(&buf) {
                 Ok(ClientPacket::Request(id, NodeRequest::Handshake { version })) => {
                     let compatible = REQUIRED_PROTOCOL_VERSION.matches(&version);
+
+                    trace!(
+                        "Got handshake from {:?} with version {}, compatible: {}",
+                        socket.get_ref().peer_addr(),
+                        version,
+                        compatible
+                    );
+
                     let msg = NodePacket::Response(
                         id,
                         Ok(NodeResponse::Handshake {
@@ -63,10 +73,14 @@ pub fn accept(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> impl Fut
             Some(_) | None => future::Either::B(future::ok(())),
         })
         .map(|()| {})
-        .map_err(|err| error!("websocket error: {:?}", err));
+        .map_err(|err| error!("Websocket error: {:?}", err));
 
     let timeout = Instant::now() + Duration::from_secs(CLIENT_HANDSHAKE_TIMEOUT_SECS);
-    Delay::new(timeout).map(|()| {}).map_err(|_| {}).join(f)
+    Delay::new(timeout)
+        .map(|()| {})
+        .map_err(|_| {})
+        .join(f)
+        .map(|((), ())| ())
 }
 
 struct ClientState; // TODO: this
