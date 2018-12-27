@@ -1,0 +1,21 @@
+[package]
+name = "tipt-node"
+version = "0.1.0"
+authors = ["cpsdqs <cpsdqs@gmail.com>"]
+description = "A tipt node"
+edition = "2018"
+
+[dependencies]
+byteorder = "1.2"
+clap = "2.32"
+fern = "0.5"
+log = "0.4"
+parking_lot = "0.7"
+rmp = "0.8"
+rmp-serde = "0.13"
+semver = { version = "0.9", features = ["serde"] }
+serde = "1.0"
+serde_derive = "1.0"
+time = "0.1"
+tokio = "0.1"
+websocket = "0.22"
