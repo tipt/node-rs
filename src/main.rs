@@ -2,6 +2,8 @@
 extern crate log;
 
 use clap::*;
+use hyper::method::Method;
+use hyper::uri::RequestUri;
 use std::net::IpAddr;
 use std::process::exit;
 use tokio::prelude::*;
@@ -127,17 +129,42 @@ fn main() {
                 })
                 .filter_map(|item| item)
                 .for_each(|(upgrade, addr)| {
-                    debug!("Acceping websocket connection from {}", addr);
-                    let f = upgrade
-                        .accept()
-                        .map_err(move |err| {
-                            error!(
-                                "Failed to accept websocket connection from {}: {:?}",
-                                addr, err
+                    let accept = match &upgrade.request.subject {
+                        (Method::Get, RequestUri::AbsolutePath(path)) => match &**path {
+                            "/ws" => true,
+                            path => {
+                                debug!(
+                                    "Rejecting websocket connection from {} (bad path {:?})",
+                                    addr, path
+                                );
+                                false
+                            }
+                        },
+                        (m, p) => {
+                            debug!(
+                                "Rejecting websocket connection from {} (bad request {:?} {:?})",
+                                addr, m, p
                             );
-                        })
-                        .and_then(|(client, _)| client::accept(client));
-                    tokio::spawn(f);
+                            false
+                        }
+                    };
+
+                    if accept {
+                        debug!("Acceping websocket connection from {}", addr);
+                        tokio::spawn(
+                            upgrade
+                                .accept()
+                                .map_err(move |err| {
+                                    error!(
+                                        "Failed to accept websocket connection from {}: {:?}",
+                                        addr, err
+                                    );
+                                })
+                                .and_then(|(client, _)| client::accept(client)),
+                        );
+                    } else {
+                        tokio::spawn(upgrade.reject().map(|_| {}).map_err(|_| {}));
+                    }
                     Ok(())
                 })
         }))
