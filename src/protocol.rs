@@ -8,8 +8,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_derive::{Deserialize, Serialize};
 use std::io::{self, Seek, SeekFrom};
 
-const MAX_PACKET_SIZE: usize = 2_100_000;
-const MAX_FORWARD_MSG_SIZE: usize = 2_000_000;
+/// Max. client packet size: 2.1 MB.
+pub const MAX_CLIENT_PACKET_SIZE: usize = 2_100_000;
+
+/// Max. fully-qualified node domain name size: 500 bytes.
+pub const MAX_NODE_FQN_SIZE: usize = 500;
+
+/// Max. forwarded message size: 2 MB.
+pub const MAX_FORWARD_MSG_SIZE: usize = 2_000_000;
 
 /// Creates a repr(primitive) enum with ser/de implementations.
 macro_rules! enum_primitive {
@@ -216,7 +222,7 @@ pub enum NodeResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum NodeErrResponse {}
 
-/// Returns the size of the given msgpack value in bytes.
+/// Reads the next msgpack object and returns its size in bytes.
 fn msgpack_value_size(cursor: &mut io::Cursor<&[u8]>) -> Result<usize, rmp_serde::decode::Error> {
     use rmp::{decode::read_marker, Marker};
     use rmp_serde::decode::Error;
@@ -300,7 +306,7 @@ impl ClientPacket {
     ///
     /// This is not implemented with serde because it requires msgpack-specific features.
     pub fn deserialize(data: &[u8]) -> Result<ClientPacket, rmp_serde::decode::Error> {
-        if data.len() > MAX_PACKET_SIZE {
+        if data.len() > MAX_CLIENT_PACKET_SIZE {
             return Err(rmp_serde::decode::Error::Uncategorized(
                 "packet too large".into(),
             ));
@@ -414,7 +420,7 @@ impl ClientPacket {
                         }
                         let body = Body::deserialize(&mut Deserializer::from_slice(body))?;
 
-                        if body.node.len() > 500 {
+                        if body.node.len() > MAX_NODE_FQN_SIZE {
                             return Err(rmp_serde::decode::Error::Uncategorized(
                                 "node name too long".into(),
                             ));
@@ -434,7 +440,7 @@ impl ClientPacket {
                         }
                         let body = Body::deserialize(&mut Deserializer::from_slice(body))?;
 
-                        if body.node.len() > 500 {
+                        if body.node.len() > MAX_NODE_FQN_SIZE {
                             return Err(rmp_serde::decode::Error::Uncategorized(
                                 "node name too long".into(),
                             ));
