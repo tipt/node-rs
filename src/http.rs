@@ -6,6 +6,7 @@ use hyper::mime::*;
 use hyper::status::StatusCode;
 use hyper::uri::RequestUri;
 use hyper::version::HttpVersion;
+use std::net::SocketAddr;
 use time::now_utc;
 use tokio::io::write_all;
 use tokio::net::TcpStream;
@@ -13,15 +14,7 @@ use tokio::prelude::*;
 use websocket::server::upgrade::Request;
 
 /// Handles a single HTTP request.
-pub fn handle_http(stream: TcpStream, request: Request) {
-    let addr = match stream.peer_addr() {
-        Ok(addr) => addr,
-        Err(_) => {
-            info!("Rejecting HTTP request with no remote address");
-            return;
-        }
-    };
-
+pub fn handle_http(stream: TcpStream, request: Request, addr: SocketAddr) {
     match request.subject {
         (method, RequestUri::AbsolutePath(path)) => match (method, &*path) {
             (Method::Post, "/api/forward") | (Method::Get, "/api/public_key") => {

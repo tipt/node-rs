@@ -5,10 +5,12 @@ use clap::*;
 use hyper::method::Method;
 use hyper::uri::RequestUri;
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::process::exit;
 use tokio::prelude::*;
 use tokio::reactor::Handle;
 use tokio::runtime::Runtime;
+use websocket::header::Headers;
 use websocket::r#async::Server;
 use websocket::server::InvalidConnection;
 
@@ -41,6 +43,13 @@ fn main() {
                 .takes_value(true)
                 .help(&format!("Sets the port (default: {})", DEFAULT_PORT)),
         )
+        .arg(
+            Arg::with_name("proxy")
+                .short("P")
+                .long("proxy")
+                .help("Set to prefer the X-Real-IP header for obtaining client addresses\n\
+                       (note that this can be spoofed if the client is connecting directly)"),
+        )
         .get_matches();
 
     let host = matches.value_of("host").unwrap_or("0.0.0.0");
@@ -60,6 +69,8 @@ fn main() {
             exit(1)
         }
     };
+
+    let proxy = matches.is_present("proxy");
 
     let (log_level, lib_log_level) = match matches.occurrences_of("verbose") {
         0 => (log::LevelFilter::Info, log::LevelFilter::Info),
@@ -111,7 +122,7 @@ fn main() {
 
             server
                 .incoming()
-                .then(|result| match result {
+                .then(move |result| match result {
                     Ok(res) => Ok(Some(res)),
                     Err(InvalidConnection {
                         stream,
@@ -123,11 +134,19 @@ fn main() {
                             match stream.peer_addr() {
                                 Ok(addr) => info!("Ignoring invalid connection from {}", addr),
                                 Err(_) => {
-                                    info!("Ignoring invalid connection from an unknown address")
+                                    info!("Ignoring invalid connection from an unknown address");
                                 }
                             }
                         } else if let (Some(stream), Some(req)) = (stream, parsed) {
-                            http::handle_http(stream, req);
+                            match stream.peer_addr() {
+                                Ok(addr) => {
+                                    let addr = peer_addr(&req.headers, addr, proxy);
+                                    http::handle_http(stream, req, addr);
+                                }
+                                Err(_) => {
+                                    info!("Ignoring invalid connection from an unknown address");
+                                }
+                            };
                         } else {
                             info!("Ignoring invalid connection from an unknown address");
                         }
@@ -176,4 +195,25 @@ fn main() {
                 })
         }))
         .expect("WebSocket server died");
+}
+
+/// Resolves a peer address that may be behind a proxy, falling back to the given address otherwise.
+fn peer_addr(headers: &Headers, addr: SocketAddr, proxy: bool) -> SocketAddr {
+    if proxy {
+        match headers.get_raw("x-real-ip") {
+            Some(bufs) => {
+                if let Some(buf) = bufs.get(0) {
+                    match String::from_utf8_lossy(buf).parse() {
+                        Ok(real_ip) => SocketAddr::new(real_ip, 0), // don’t know the port
+                        Err(_) => addr,
+                    }
+                } else {
+                    addr
+                }
+            }
+            None => addr,
+        }
+    } else {
+        addr
+    }
 }
