@@ -119,10 +119,17 @@ fn main() {
                         buffer: _,
                         error: _,
                     }) => {
-                        if let (Some(stream), Some(req)) = (stream, parsed) {
+                        if let (Some(stream), None) = (&stream, &parsed) {
+                            match stream.peer_addr() {
+                                Ok(addr) => info!("Ignoring invalid connection from {}", addr),
+                                Err(_) => {
+                                    info!("Ignoring invalid connection from an unknown address")
+                                }
+                            }
+                        } else if let (Some(stream), Some(req)) = (stream, parsed) {
                             http::handle_http(stream, req);
                         } else {
-                            trace!("Ignoring invalid connection");
+                            info!("Ignoring invalid connection from an unknown address");
                         }
                         Ok(None)
                     }
@@ -133,16 +140,16 @@ fn main() {
                         (Method::Get, RequestUri::AbsolutePath(path)) => match &**path {
                             "/ws" => true,
                             path => {
-                                debug!(
-                                    "Rejecting websocket connection from {} (bad path {:?})",
+                                info!(
+                                    "Rejecting websocket connection from {} (bad path {})",
                                     addr, path
                                 );
                                 false
                             }
                         },
                         (m, p) => {
-                            debug!(
-                                "Rejecting websocket connection from {} (bad request {:?} {:?})",
+                            info!(
+                                "Rejecting websocket connection from {} (bad request {} {})",
                                 addr, m, p
                             );
                             false
@@ -150,17 +157,17 @@ fn main() {
                     };
 
                     if accept {
-                        debug!("Acceping websocket connection from {}", addr);
+                        info!("Acceping websocket connection from {}", addr);
                         tokio::spawn(
                             upgrade
                                 .accept()
                                 .map_err(move |err| {
                                     error!(
-                                        "Failed to accept websocket connection from {}: {:?}",
+                                        "Failed to accept websocket connection from {}: {}",
                                         addr, err
                                     );
                                 })
-                                .and_then(|(client, _)| client::accept(client)),
+                                .and_then(move |(client, _)| client::accept(client, addr)),
                         );
                     } else {
                         tokio::spawn(upgrade.reject().map(|_| {}).map_err(|_| {}));

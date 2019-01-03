@@ -9,6 +9,8 @@ use parking_lot::Mutex;
 use rmp_serde::Serializer;
 use semver::{Version, VersionReq};
 use serde::Serialize;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::codec::Framed;
 use tokio::prelude::*;
@@ -27,7 +29,11 @@ lazy_static! {
 /// Accepts a websocket connection and creates a client if a Handshake message is received on time.
 pub fn accept(
     socket: Framed<TcpStream, MessageCodec<OwnedMessage>>,
+    addr: SocketAddr,
 ) -> impl Future<Item = (), Error = ()> {
+    let did_accept: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let did_accept_clone = Arc::clone(&did_accept);
+
     let f = socket
         .into_future()
         .map_err(|(err, _)| err)
@@ -36,11 +42,9 @@ pub fn accept(
                 Ok(ClientPacket::Request(id, NodeRequest::Handshake { version })) => {
                     let compatible = REQUIRED_PROTOCOL_VERSION.matches(&version);
 
-                    trace!(
-                        "Got handshake from {:?} with version {}, compatible: {}",
-                        socket.get_ref().peer_addr(),
-                        version,
-                        compatible
+                    info!(
+                        "Got handshake from {} with version {}, compatible: {}",
+                        addr, version, compatible
                     );
 
                     let msg = NodePacket::Response(
@@ -52,7 +56,8 @@ pub fn accept(
                     );
 
                     if REQUIRED_PROTOCOL_VERSION.matches(&version) {
-                        let client = Client::new(socket);
+                        *did_accept_clone.lock() = true;
+                        let client = Client::new(socket, addr);
                         client.send(msg);
                         future::Either::A(client)
                     } else {
@@ -74,15 +79,43 @@ pub fn accept(
             },
             Some(_) | None => future::Either::B(future::ok(())),
         })
-        .map(|()| {})
-        .map_err(|err| error!("Websocket error: {:?}", err));
+        .map_err(move |err| error!("Websocket error from {}: {:?}", addr, err));
 
-    let timeout = Instant::now() + Duration::from_secs(CLIENT_HANDSHAKE_TIMEOUT_SECS);
-    Delay::new(timeout)
-        .map(|()| {})
-        .map_err(|_| {})
-        .join(f)
-        .map(|((), ())| ())
+    struct ClientAccept<F: Future<Item = (), Error = ()>> {
+        timeout: Option<(Delay, Arc<Mutex<bool>>, SocketAddr)>,
+        f: F,
+    }
+
+    impl<F: Future<Item = (), Error = ()>> Future for ClientAccept<F> {
+        type Item = ();
+        type Error = ();
+
+        fn poll(&mut self) -> Poll<(), ()> {
+            match &mut self.timeout {
+                Some((ref mut timeout, did_accept, addr)) => match timeout.poll() {
+                    Ok(Async::NotReady) => self.f.poll(),
+                    Ok(Async::Ready(())) => {
+                        if *did_accept.lock() {
+                            self.timeout = None;
+                            self.f.poll()
+                        } else {
+                            info!("Dropping connection to {} (handshake timed out)", addr);
+                            Ok(Async::Ready(()))
+                        }
+                    }
+                    Err(_) => Err(()),
+                },
+                None => self.f.poll(),
+            }
+        }
+    }
+
+    let timeout = Delay::new(Instant::now() + Duration::from_secs(CLIENT_HANDSHAKE_TIMEOUT_SECS));
+
+    ClientAccept {
+        timeout: Some((timeout, did_accept, addr)),
+        f,
+    }
 }
 
 struct ClientState; // TODO: this
@@ -95,11 +128,12 @@ pub struct Client {
     msg_queue: mpsc::UnboundedReceiver<OwnedMessage>,
     msg_queue_in: mpsc::UnboundedSender<OwnedMessage>,
     state: Mutex<ClientState>,
+    addr: SocketAddr,
     closing: Option<CloseData>,
 }
 
 impl Client {
-    fn new(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>) -> Client {
+    fn new(socket: Framed<TcpStream, MessageCodec<OwnedMessage>>, addr: SocketAddr) -> Client {
         let (msg_queue_in, msg_queue) = mpsc::unbounded();
 
         Client {
@@ -107,6 +141,7 @@ impl Client {
             msg_queue,
             msg_queue_in,
             state: Mutex::new(ClientState),
+            addr,
             closing: None,
         }
     }
@@ -146,6 +181,10 @@ impl Client {
     /// Note that this will not actually forcefully close the connection until this struct is
     /// dropped.
     pub fn close(&mut self, status_code: u16, reason: String) {
+        info!(
+            "Closing connection to {}: {} {:?}",
+            self.addr, status_code, reason
+        );
         self.closing = Some(CloseData {
             status_code,
             reason,
@@ -204,6 +243,7 @@ impl Future for Client {
                     _ => unimplemented!("message received"),
                 }
             } else {
+                info!("Dropping connection to {} (socket closed)", self.addr);
                 return Ok(Async::Ready(()));
             }
         }

@@ -14,7 +14,13 @@ use websocket::server::upgrade::Request;
 
 /// Handles a single HTTP request.
 pub fn handle_http(stream: TcpStream, request: Request) {
-    trace!("Got HTTP request from {:?}", stream.peer_addr());
+    let addr = match stream.peer_addr() {
+        Ok(addr) => addr,
+        Err(_) => {
+            info!("Rejecting HTTP request with no remote address");
+            return;
+        }
+    };
 
     match request.subject {
         (method, RequestUri::AbsolutePath(path)) => match (method, &*path) {
@@ -25,15 +31,17 @@ pub fn handle_http(stream: TcpStream, request: Request) {
                         .map_err(|_| {}),
                 );
             }
-            _ => {
+            (m, p) => {
+                info!("{}: not found: {} {}", addr, m, p);
                 tokio::spawn(write_html_error(
                     stream,
                     request.version,
-                    StatusCode::BadRequest,
+                    StatusCode::NotFound,
                 ));
             }
         },
-        _ => {
+        (m, p) => {
+            info!("{}: bad request: {} {}", addr, m, p);
             tokio::spawn(write_html_error(
                 stream,
                 request.version,
