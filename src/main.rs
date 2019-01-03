@@ -154,7 +154,9 @@ fn main() {
                     }
                 })
                 .filter_map(|item| item)
-                .for_each(|(upgrade, addr)| {
+                .for_each(move |(upgrade, addr)| {
+                    let addr = peer_addr(&upgrade.headers, addr, proxy);
+
                     let accept = match &upgrade.request.subject {
                         (Method::Get, RequestUri::AbsolutePath(path)) => match &**path {
                             "/ws" => true,
